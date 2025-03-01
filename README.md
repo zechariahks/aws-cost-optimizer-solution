@@ -11,11 +11,11 @@ This solution provides a comprehensive, automated approach to optimize costs acr
 
 The solution uses AWS Compute Optimizer's machine learning-powered recommendations to automatically identify and implement cost-saving opportunities while maintaining performance.
 
-If you want to deploy only specifc optimizer component, then go to the respective folder and follow the README file. 
+If you want to deploy only specific optimizer component, then go to the respective folder and follow the README file.
 
 ## Architecture
 
-![Architecture Diagram]
+![Architecture Diagram](lambda-cost-optimizer.jpg)
 
 ### Components
 
@@ -112,6 +112,9 @@ If you want to deploy only specifc optimizer component, then go to the respectiv
             ParameterKey=OptimizerScheduleExpression,ParameterValue="rate(1 day)" 
     ```
 
+### Review the cost-optimization results
+
+Once the deployment is complete, depending on when the Cost Optimization status became active in the account, it takes around 24 hours to generate recommendations. Event Bridge rules are scheduleed to run daily at once. Lambda functions will be invoked on this schedule and update the resource configurations as per the Compute Optimizer recommendations. 
 
 ### Clean Up
 
