@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RDS Cost Optimization with Compute Optimizer Infrastructure'
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: 'Schedule expression for the EventBridge rule'
+
+Resources:
+  # IAM Roles
+  ComputeOptimizerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: rds_compute_optimizer_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ComputeOptimizerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'compute-optimizer:GetRDSInstanceRecommendations'
+                  - 'rds:DescribeDBInstances'
+                  - 'ssm:PutParameter'
+                Resource: '*'
+
+  UpdateRDSRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: rds_update_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: UpdateRDSConfig
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'rds:ModifyDBInstance'
+                  - 'rds:DescribeDBInstances'
+                  - 'ssm:GetParameter'
+                Resource: '*'
+
+  # Lambda Functions
+  ComputeOptimizerLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: compute_optimizer_rds
+      Runtime: python3.8
+      Handler: compute_optimizer_rds.lambda_handler
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('compute-optimizer')
+                  ssm_client = boto3.client('ssm')
+                  rds_client = boto3.client('rds')
+                  
+                  response = client.get_rds_instance_recommendations()
+                  
+                  recommendations_processed = 0
+                  for recommendation in response['instanceRecommendations']:
+                      db_instance_id = recommendation['instanceArn'].split(':')[-1]
+                      current_instance_type = recommendation['currentInstanceType']
+                      
+                      instance_response = rds_client.describe_db_instances(
+                          DBInstanceIdentifier=db_instance_id
+                      )
+                      
+                      if instance_response['DBInstances']:
+                          if recommendation['recommendationOptions']:
+                              recommended_instance_type = recommendation['recommendationOptions'][0]['instanceType']
+                              
+                              param_name = f"/rds/instance-type/{db_instance_id}"
+                              param_value = json.dumps({
+                                  'db_instance_id': db_instance_id,
+                                  'current_type': current_instance_type,
+                                  'recommended_type': recommended_instance_type,
+                                  'last_updated': datetime.now().isoformat()
+                              })
+                              
+                              ssm_client.put_parameter(
+                                  Name=param_name,
+                                  Value=param_value,
+                                  Type='String',
+                                  Overwrite=True
+                              )
+                              
+                              recommendations_processed += 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {recommendations_processed} recommendations'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  UpdateRDSLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: update_rds_instance
+      Runtime: python3.8
+      Handler: update_rds_instance.lambda_handler
+      Role: !GetAtt UpdateRDSRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  param_name = event['detail']['name']
+                  
+                  ssm_client = boto3.client('ssm')
+                  rds_client = boto3.client('rds')
+                  
+                  param_response = ssm_client.get_parameter(Name=param_name)
+                  param_value = json.loads(param_response['Parameter']['Value'])
+                  
+                  db_instance_id = param_value['db_instance_id']
+                  recommended_type = param_value['recommended_type']
+                  
+                  instance_response = rds_client.describe_db_instances(
+                      DBInstanceIdentifier=db_instance_id
+                  )
+                  
+                  if instance_response['DBInstances']:
+                      db_instance = instance_response['DBInstances'][0]
+                      
+                      if db_instance['DBInstanceStatus'] == 'available':
+                          response = rds_client.modify_db_instance(
+                              DBInstanceIdentifier=db_instance_id,
+                              DBInstanceClass=recommended_type,
+                              ApplyImmediately=False
+                          )
+                          
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': f'Successfully scheduled update for DB instance {db_instance_id}'
+                              })
+                          }
+                      else:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({
+                                  'message': f'DB Instance {db_instance_id} is not available'
+                              })
+                          }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  # EventBridge Rules
+  OptimizationScheduleRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: RDSOptimizationSchedule
+      Description: 'Triggers Lambda to fetch Compute Optimizer recommendations'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerLambda
+          Arn: !GetAtt ComputeOptimizerLambda.Arn
+
+  ParameterChangeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: RDSParameterChangeRule
+      Description: 'Monitors SSM Parameter Store changes'
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - 'Parameter Store Change'
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: '/rds/instance-type/'
+      State: ENABLED
+      Targets:
+        - Id: UpdateRDSLambda
+          Arn: !GetAtt UpdateRDSLambda.Arn
+
+  # Lambda Permissions
+  ComputeOptimizerLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ComputeOptimizerLambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt OptimizationScheduleRule.Arn
+
+  UpdateRDSLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref UpdateRDSLambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt ParameterChangeRule.Arn
+
+Outputs:
+  ComputeOptimizerLambdaArn:
+    Description: 'ARN of the Compute Optimizer Lambda function'
+    Value: !GetAtt ComputeOptimizerLambda.Arn
+
+  UpdateRDSLambdaArn:
+    Description: 'ARN of the Update RDS Lambda function'
+    Value: !GetAtt UpdateRDSLambda.Arn

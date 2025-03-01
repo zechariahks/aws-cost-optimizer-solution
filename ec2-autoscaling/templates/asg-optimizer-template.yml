@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ASG Cost Optimization with Compute Optimizer Infrastructure'
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: 'Schedule expression for the EventBridge rule'
+
+Resources:
+  # IAM Roles
+  ComputeOptimizerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: asg_compute_optimizer_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ComputeOptimizerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'compute-optimizer:GetAutoScalingGroupRecommendations'
+                  - 'autoscaling:DescribeAutoScalingGroups'
+                  - 'ssm:PutParameter'
+                Resource: '*'
+
+  UpdateASGRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: asg_update_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: UpdateASGConfig
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'autoscaling:UpdateAutoScalingGroup'
+                  - 'autoscaling:DescribeAutoScalingGroups'
+                  - 'autoscaling:DescribeLaunchConfigurations'
+                  - 'autoscaling:CreateLaunchConfiguration'
+                  - 'ec2:CreateLaunchTemplateVersion'
+                  - 'ssm:GetParameter'
+                Resource: '*'
+
+  # Lambda Functions
+  ComputeOptimizerLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: compute_optimizer_asg
+      Runtime: python3.8
+      Handler: compute_optimizer_asg.lambda_handler
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('compute-optimizer')
+                  ssm_client = boto3.client('ssm')
+                  autoscaling_client = boto3.client('autoscaling')
+                  
+                  response = client.get_auto_scaling_group_recommendations()
+                  
+                  recommendations_processed = 0
+                  for recommendation in response['autoScalingGroupRecommendations']:
+                      asg_name = recommendation['autoScalingGroupName']
+                      current_instance_type = recommendation['currentInstanceType']
+                      
+                      if recommendation['recommendationOptions']:
+                          recommended_instance_type = recommendation['recommendationOptions'][0]['instanceType']
+                          
+                          param_name = f"/asg/instance-type/{asg_name}"
+                          param_value = json.dumps({
+                              'asg_name': asg_name,
+                              'current_type': current_instance_type,
+                              'recommended_type': recommended_instance_type,
+                              'last_updated': datetime.now().isoformat()
+                          })
+                          
+                          ssm_client.put_parameter(
+                              Name=param_name,
+                              Value=param_value,
+                              Type='String',
+                              Overwrite=True
+                          )
+                          
+                          recommendations_processed += 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {recommendations_processed} recommendations'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  UpdateASGLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: update_asg_instance
+      Runtime: python3.8
+      Handler: update_asg_instance.lambda_handler
+      Role: !GetAtt UpdateASGRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  param_name = event['detail']['name']
+                  
+                  ssm_client = boto3.client('ssm')
+                  autoscaling_client = boto3.client('autoscaling')
+                  
+                  param_response = ssm_client.get_parameter(Name=param_name)
+                  param_value = json.loads(param_response['Parameter']['Value'])
+                  
+                  asg_name = param_value['asg_name']
+                  recommended_type = param_value['recommended_type']
+                  
+                  asg_response = autoscaling_client.describe_auto_scaling_groups(
+                      AutoScalingGroupNames=[asg_name]
+                  )
+                  
+                  if asg_response['AutoScalingGroups']:
+                      asg = asg_response['AutoScalingGroups'][0]
+                      
+                      if 'LaunchTemplate' in asg:
+                          ec2_client = boto3.client('ec2')
+                          launch_template_id = asg['LaunchTemplate']['LaunchTemplateId']
+                          
+                          response = ec2_client.create_launch_template_version(
+                              LaunchTemplateId=launch_template_id,
+                              SourceVersion=str(asg['LaunchTemplate']['Version']),
+                              LaunchTemplateData={
+                                  'InstanceType': recommended_type
+                              }
+                          )
+                          
+                          new_version = response['LaunchTemplateVersion']['VersionNumber']
+                          
+                          autoscaling_client.update_auto_scaling_group(
+                              AutoScalingGroupName=asg_name,
+                              LaunchTemplate={
+                                  'LaunchTemplateId': launch_template_id,
+                                  'Version': str(new_version)
+                              }
+                          )
+                      else:
+                          launch_config_name = f"{asg_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                          
+                          launch_config_response = autoscaling_client.describe_launch_configurations(
+                              LaunchConfigurationNames=[asg['LaunchConfigurationName']]
+                          )
+                          
+                          if launch_config_response['LaunchConfigurations']:
+                              current_config = launch_config_response['LaunchConfigurations'][0]
+                              
+                              autoscaling_client.create_launch_configuration(
+                                  LaunchConfigurationName=launch_config_name,
+                                  ImageId=current_config['ImageId'],
+                                  InstanceType=recommended_type,
+                                  SecurityGroups=current_config['SecurityGroups'],
+                                  KeyName=current_config.get('KeyName'),
+                                  UserData=current_config.get('UserData'),
+                                  IamInstanceProfile=current_config.get('IamInstanceProfile')
+                              )
+                              
+                              autoscaling_client.update_auto_scaling_group(
+                                  AutoScalingGroupName=asg_name,
+                                  LaunchConfigurationName=launch_config_name
+                              )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully updated ASG {asg_name}'
+                      })
+                  }
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  # EventBridge Rules
+  OptimizationScheduleRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: ASGOptimizationSchedule
+      Description: 'Triggers Lambda to fetch Compute Optimizer recommendations'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerLambda
+          Arn: !GetAtt ComputeOptimizerLambda.Arn
+
+  ParameterChangeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: ASGParameterChangeRule
+      Description: 'Monitors SSM Parameter Store changes'
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - 'Parameter Store Change'
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: '/asg/instance-type/'
+      State: ENABLED
+      Targets:
+        - Id: UpdateASGLambda
+          Arn: !GetAtt UpdateASGLambda.Arn
+
+  # Lambda Permissions
+  ComputeOptimizerLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ComputeOptimizerLambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt OptimizationScheduleRule.Arn
+
+  UpdateASGLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref UpdateASGLambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt ParameterChangeRule.Arn
+
+Outputs:
+  ComputeOptimizerLambdaArn:
+    Description: 'ARN of the Compute Optimizer Lambda function'
+    Value: !GetAtt ComputeOptimizerLambda.Arn
+
+  UpdateASGLambdaArn:
+    Description: 'ARN of the Update ASG Lambda function'
+    Value: !GetAtt UpdateASGLambda.Arn

@@ -1,0 +1,826 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Unified AWS Cost Optimization Solution with Compute Optimizer
+
+Parameters:
+  OptimizerScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+    Description: Schedule expression for resources optimization
+
+Resources:
+  # Common SSM Parameters
+  OptimizationConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cost-optimizer/config
+      Type: String
+      Value: !Sub |
+        {
+          "enabled": true,
+          "last_updated": "${AWS::StackName}",
+          "stack_id": "${AWS::StackId}"
+        }
+      Description: Configuration for cost optimizer
+
+  # IAM Roles
+  ComputeOptimizerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-compute-optimizer-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComputeOptimizerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - ec2:DescribeInstances
+                  - compute-optimizer:GetAutoScalingGroupRecommendations
+                  - autoscaling:DescribeAutoScalingGroups
+                  - compute-optimizer:GetRDSInstanceRecommendations
+                  - rds:DescribeDBInstances
+                  - compute-optimizer:GetEBSVolumeRecommendations
+                  - ec2:DescribeVolumes
+                  - compute-optimizer:GetLambdaFunctionRecommendations
+                  - lambda:ListFunctions
+                  - ssm:PutParameter
+                Resource: '*'
+
+  UpdateResourcesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-compute-update-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UpdateComputeResourcesConfig
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeLaunchConfigurations
+                  - autoscaling:CreateLaunchConfiguration
+                  - ec2:CreateLaunchTemplateVersion
+                  - rds:ModifyDBInstance
+                  - rds:DescribeDBInstances
+                  - lambda:UpdateFunctionConfiguration
+                  - ssm:GetParameter
+                Resource: '*'
+
+  # Lambda Functions
+  ComputeOptimizerEC2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ec2-optimizer
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('compute-optimizer')
+                  ssm_client = boto3.client('ssm')
+                  ec2_client = boto3.client('ec2')
+
+                  response = client.get_ec2_instance_recommendations()
+
+                  recommendations_processed = 0
+                  for recommendation in response['instanceRecommendations']:
+                      instance_id = recommendation['instanceArn'].split('/')[-1]
+                      current_instance_type = recommendation['currentInstanceType']
+
+                      if recommendation['recommendationOptions']:
+                          recommended_instance_type = recommendation['recommendationOptions'][0]['instanceType']
+
+                          param_name = f"/cost-optimizer/ec2/instance-type/{instance_id}"
+                          param_value = json.dumps({
+                              'instance_id': instance_id,
+                              'current_type': current_instance_type,
+                              'recommended_type': recommended_instance_type,
+                              'last_updated': datetime.now().isoformat()
+                          })
+
+                          ssm_client.put_parameter(
+                              Name=param_name,
+                              Value=param_value,
+                              Type='String',
+                              Overwrite=True
+                          )
+
+                          recommendations_processed += 1
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {recommendations_processed} recommendations'
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  UpdateEC2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ec2-updater
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdateResourcesRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  param_name = event['detail']['name']
+
+                  ssm_client = boto3.client('ssm')
+                  ec2_client = boto3.client('ec2')
+
+                  param_response = ssm_client.get_parameter(Name=param_name)
+                  param_value = json.loads(param_response['Parameter']['Value'])
+
+                  instance_id = param_value['instance_id']
+                  recommended_type = param_value['recommended_type']
+
+                  response = ec2_client.describe_instances(InstanceIds=[instance_id])
+
+                  if response['Reservations']:
+                      instance = response['Reservations'][0]['Instances'][0]
+
+                      if instance['State']['Name'] == 'stopped':
+                          ec2_client.modify_instance_attribute(
+                              InstanceId=instance_id,
+                              InstanceType={'Value': recommended_type}
+                          )
+
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': f'Successfully updated instance {instance_id}'
+                              })
+                          }
+                      else:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({
+                                  'message': f'Instance {instance_id} must be stopped first'
+                              })
+                          }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  ComputeOptimizerASGLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-asg-optimizer
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('compute-optimizer')
+                  ssm_client = boto3.client('ssm')
+                  autoscaling_client = boto3.client('autoscaling')
+
+                  response = client.get_auto_scaling_group_recommendations()
+
+                  recommendations_processed = 0
+                  for recommendation in response['autoScalingGroupRecommendations']:
+                      asg_name = recommendation['autoScalingGroupName']
+                      current_instance_type = recommendation['currentInstanceType']
+
+                      if recommendation['recommendationOptions']:
+                          recommended_instance_type = recommendation['recommendationOptions'][0]['instanceType']
+
+                          param_name = f"/cost-optimizer/asg/instance-type/{asg_name}"
+                          param_value = json.dumps({
+                              'asg_name': asg_name,
+                              'current_type': current_instance_type,
+                              'recommended_type': recommended_instance_type,
+                              'last_updated': datetime.now().isoformat()
+                          })
+
+                          ssm_client.put_parameter(
+                              Name=param_name,
+                              Value=param_value,
+                              Type='String',
+                              Overwrite=True
+                          )
+
+                          recommendations_processed += 1
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {recommendations_processed} recommendations'
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  UpdateASGLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-asg-updater
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdateResourcesRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  param_name = event['detail']['name']
+
+                  ssm_client = boto3.client('ssm')
+                  autoscaling_client = boto3.client('autoscaling')
+
+                  param_response = ssm_client.get_parameter(Name=param_name)
+                  param_value = json.loads(param_response['Parameter']['Value'])
+
+                  asg_name = param_value['asg_name']
+                  recommended_type = param_value['recommended_type']
+
+                  asg_response = autoscaling_client.describe_auto_scaling_groups(
+                      AutoScalingGroupNames=[asg_name]
+                  )
+
+                  if asg_response['AutoScalingGroups']:
+                      asg = asg_response['AutoScalingGroups'][0]
+
+                      if 'LaunchTemplate' in asg:
+                          ec2_client = boto3.client('ec2')
+                          launch_template_id = asg['LaunchTemplate']['LaunchTemplateId']
+
+                          response = ec2_client.create_launch_template_version(
+                              LaunchTemplateId=launch_template_id,
+                              SourceVersion=str(asg['LaunchTemplate']['Version']),
+                              LaunchTemplateData={
+                                  'InstanceType': recommended_type
+                              }
+                          )
+
+                          new_version = response['LaunchTemplateVersion']['VersionNumber']
+
+                          autoscaling_client.update_auto_scaling_group(
+                              AutoScalingGroupName=asg_name,
+                              LaunchTemplate={
+                                  'LaunchTemplateId': launch_template_id,
+                                  'Version': str(new_version)
+                              }
+                          )
+                      else:
+                          launch_config_name = f"{asg_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+                          launch_config_response = autoscaling_client.describe_launch_configurations(
+                              LaunchConfigurationNames=[asg['LaunchConfigurationName']]
+                          )
+
+                          if launch_config_response['LaunchConfigurations']:
+                              current_config = launch_config_response['LaunchConfigurations'][0]
+
+                              autoscaling_client.create_launch_configuration(
+                                  LaunchConfigurationName=launch_config_name,
+                                  ImageId=current_config['ImageId'],
+                                  InstanceType=recommended_type,
+                                  SecurityGroups=current_config['SecurityGroups'],
+                                  KeyName=current_config.get('KeyName'),
+                                  UserData=current_config.get('UserData'),
+                                  IamInstanceProfile=current_config.get('IamInstanceProfile')
+                              )
+
+                              autoscaling_client.update_auto_scaling_group(
+                                  AutoScalingGroupName=asg_name,
+                                  LaunchConfigurationName=launch_config_name
+                              )
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully updated ASG {asg_name}'
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  ComputeOptimizerRDSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-rds-optimizer
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('compute-optimizer')
+                  ssm_client = boto3.client('ssm')
+                  rds_client = boto3.client('rds')
+
+                  response = client.get_rds_instance_recommendations()
+
+                  recommendations_processed = 0
+                  for recommendation in response['instanceRecommendations']:
+                      db_instance_id = recommendation['instanceArn'].split(':')[-1]
+                      current_instance_type = recommendation['currentInstanceType']
+
+                      if recommendation['recommendationOptions']:
+                          recommended_instance_type = recommendation['recommendationOptions'][0]['instanceType']
+
+                          param_name = f"/cost-optimizer/rds/instance-type/{db_instance_id}"
+                          param_value = json.dumps({
+                              'db_instance_id': db_instance_id,
+                              'current_type': current_instance_type,
+                              'recommended_type': recommended_instance_type,
+                              'last_updated': datetime.now().isoformat()
+                          })
+
+                          ssm_client.put_parameter(
+                              Name=param_name,
+                              Value=param_value,
+                              Type='String',
+                              Overwrite=True
+                          )
+
+                          recommendations_processed += 1
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {recommendations_processed} recommendations'
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  UpdateRDSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-rds-updater
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdateResourcesRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  param_name = event['detail']['name']
+
+                  ssm_client = boto3.client('ssm')
+                  rds_client = boto3.client('rds')
+
+                  param_response = ssm_client.get_parameter(Name=param_name)
+                  param_value = json.loads(param_response['Parameter']['Value'])
+
+                  db_instance_id = param_value['db_instance_id']
+                  recommended_type = param_value['recommended_type']
+
+                  instance_response = rds_client.describe_db_instances(
+                      DBInstanceIdentifier=db_instance_id
+                  )
+
+                  if instance_response['DBInstances']:
+                      db_instance = instance_response['DBInstances'][0]
+
+                      if db_instance['DBInstanceStatus'] == 'available':
+                          response = rds_client.modify_db_instance(
+                              DBInstanceIdentifier=db_instance_id,
+                              DBInstanceClass=recommended_type,
+                              ApplyImmediately=False
+                          )
+
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': f'Successfully scheduled update for DB instance {db_instance_id}'
+                              })
+                          }
+                      else:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({
+                                  'message': f'DB Instance {db_instance_id} is not available'
+                              })
+                          }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  CostOptimizerLambdaForLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-lambda-optimizer
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('compute-optimizer')
+                  ssm_client = boto3.client('ssm')
+
+                  response = client.get_lambda_function_recommendations()
+
+                  recommendations_processed = 0
+                  for recommendation in response['lambdaFunctionRecommendations']:
+                      function_arn = recommendation['functionArn']
+                      memory_size = recommendation['memorySizeRecommendationOptions'][0]['rankedOptions'][0]['memorySize']
+                      param_name = f"/lambda/memory/{function_arn.split(':')[-1]}"
+
+                      ssm_client.put_parameter(
+                          Name=param_name,
+                          Value=str(memory_size),
+                          Type='String',
+                          Overwrite=True
+                      )
+
+                      recommendations_processed += 1
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {recommendations_processed} recommendations'
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+  UpdateLambdaLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-lambda-updater
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdateResourcesRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  param_name = event['detail']['name']
+
+                  ssm_client = boto3.client('ssm')
+                  lambda_client = boto3.client('lambda')
+
+                  param_response = ssm_client.get_parameter(Name=param_name)
+                  memory_size = int(param_response['Parameter']['Value'])
+
+                  function_arn = param_name.split('/')[-1]
+
+                  lambda_client.update_function_configuration(
+                      FunctionName=function_arn,
+                      MemorySize=memory_size
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully updated Lambda function {function_arn}'
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+  # EventBridge Rules
+  EC2OptimizationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-ec2-schedule
+      Description: Triggers Lambda to fetch EC2 Compute Optimizer recommendations
+      ScheduleExpression: !Ref OptimizerScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerEC2Lambda
+          Arn: !GetAtt ComputeOptimizerEC2Lambda.Arn
+
+  EC2ParameterChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-ec2-parameter
+      Description: Monitors EC2 SSM Parameter Store changes
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - Parameter Store Change
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: /cost-optimizer/ec2/instance-type/
+      State: ENABLED
+      Targets:
+        - Id: UpdateEC2Lambda
+          Arn: !GetAtt UpdateEC2Lambda.Arn
+
+  ASGOptimizationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-asg-schedule
+      Description: Triggers Lambda to fetch ASG Compute Optimizer recommendations
+      ScheduleExpression: !Ref OptimizerScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerASGLambda
+          Arn: !GetAtt ComputeOptimizerASGLambda.Arn
+
+  ASGParameterChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-asg-parameter
+      Description: Monitors ASG SSM Parameter Store changes
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - Parameter Store Change
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: /cost-optimizer/asg/instance-type/
+      State: ENABLED
+      Targets:
+        - Id: UpdateASGLambda
+          Arn: !GetAtt UpdateASGLambda.Arn
+
+  RDSOptimizationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-rds-schedule
+      Description: Triggers Lambda to fetch RDS Compute Optimizer recommendations
+      ScheduleExpression: !Ref OptimizerScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerRDSLambda
+          Arn: !GetAtt ComputeOptimizerRDSLambda.Arn
+
+  RDSParameterChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-rds-parameter
+      Description: Monitors RDS SSM Parameter Store changes
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - Parameter Store Change
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: /cost-optimizer/rds/instance-type/
+      State: ENABLED
+      Targets:
+        - Id: UpdateRDSLambda
+          Arn: !GetAtt UpdateRDSLambda.Arn
+
+  LambdaOptimizationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-lambda-schedule
+      Description: Triggers Lambda to fetch Lambda Compute Optimizer recommendations
+      ScheduleExpression: !Ref OptimizerScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerLambdaForLambda
+          Arn: !GetAtt ComputeOptimizerLambdaForLambda.Arn
+  LambdaParameterChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-lambda-parameter
+      Description: Monitors Lambda SSM Parameter Store changes
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - Parameter Store Change
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: /cost-optimizer/lambda/memory/
+      State: ENABLED
+      Targets:
+        - Id: UpdateLambdaLambda
+          Arn: !GetAtt UpdateLambdaLambda.Arn
+  # Lambda Permissions
+  ComputeOptimizerEC2LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ComputeOptimizerEC2Lambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EC2OptimizationScheduleRule.Arn
+
+  UpdateEC2LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateEC2Lambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EC2ParameterChangeRule.Arn
+
+  ComputeOptimizerASGLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ComputeOptimizerASGLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ASGOptimizationScheduleRule.Arn
+
+  UpdateASGLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateASGLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ASGParameterChangeRule.Arn
+
+  ComputeOptimizerRDSLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ComputeOptimizerRDSLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RDSOptimizationScheduleRule.Arn
+
+  UpdateRDSLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateRDSLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RDSParameterChangeRule.Arn
+
+  ComputeOptimizerLambdaForLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ComputeOptimizerLambdaForLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaOptimizationScheduleRule.Arn
+
+  UpdateLambdaLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateLambdaLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaParameterChangeRule.Arn
+
+Outputs:
+  EC2OptimizerLambdaArn:
+    Description: ARN of the EC2 Compute Optimizer Lambda function
+    Value: !GetAtt ComputeOptimizerEC2Lambda.Arn
+
+  EC2UpdaterLambdaArn:
+    Description: ARN of the EC2 Update Lambda function
+    Value: !GetAtt UpdateEC2Lambda.Arn
+
+  ASGOptimizerLambdaArn:
+    Description: ARN of the ASG Compute Optimizer Lambda function
+    Value: !GetAtt ComputeOptimizerASGLambda.Arn
+
+  ASGUpdateLambdaArn:
+    Description: ARN of the ASG Update Lambda function
+    Value: !GetAtt UpdateASGLambda.Arn
+
+  RDSOptimizerLambdaArn:
+    Description: ARN of the RDS Compute Optimizer Lambda function
+    Value: !GetAtt ComputeOptimizerRDSLambda.Arn
+
+  RDSUpdateLambdaArn:
+    Description: ARN of the RDS Update Lambda function
+    Value: !GetAtt UpdateRDSLambda.Arn
+
+  StackName:
+    Description: Name of the stack
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: Region where the stack is deployed
+    Value: !Ref AWS::Region

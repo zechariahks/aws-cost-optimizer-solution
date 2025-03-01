@@ -1,0 +1,37 @@
+Resources:
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: basic-lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Path: '/'
+
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MyFunction
+      MemorySize: !Ref MemoryParameter
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: 
+        ZipFile: |
+          def lambda_handler(event, context):
+            return {
+                'statusCode': 200,
+                'body': 'Hello from Lambda!'
+            }
+      Runtime: python3.12
+Parameters:
+  MemoryParameter:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /lambda/memory/MyFunction

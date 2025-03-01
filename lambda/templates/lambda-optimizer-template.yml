@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda Cost Optimization with Compute Optimizer Infrastructure'
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 hour)'
+    Description: 'Schedule expression for the EventBridge rule'
+
+Resources:
+  # IAM Roles
+  ComputeOptimizerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: lambda_fetch_compute_optimizer_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ComputeOptimizerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'compute-optimizer:GetLambdaFunctionRecommendations'
+                  - 'ssm:PutParameter'
+                Resource: '*'
+
+  UpdateLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: lambda_update_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: UpdateLambdaConfig
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:UpdateFunctionConfiguration'
+                  - 'ssm:GetParameter'
+                Resource: '*'
+
+  # Lambda Functions
+  ComputeOptimizerLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: compute_optimizer_lambda
+      Runtime:  python3.13
+      Handler: compute_optimizer_lambda.get_lambda_recommendations
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          
+          def get_lambda_recommendations(event, context):
+              client = boto3.client('compute-optimizer')
+              response = client.get_lambda_function_recommendations()
+              
+              ssm_client = boto3.client('ssm')
+              
+              for recommendation in response['lambdaFunctionRecommendations']:
+                  function_arn = recommendation['functionArn']
+                  memory_size = recommendation['memorySizeRecommendationOptions'][0]['rankedOptions'][0]['memorySize']
+                  param_name = f"/lambda/memory/{function_arn.split(':')[-1]}"
+                  
+                  ssm_client.put_parameter(
+                      Name=param_name,
+                      Value=str(memory_size),
+                      Type='String',
+                      Overwrite=True
+                  )
+          
+              return {'status': 'Success'}
+      Timeout: 300
+      MemorySize: 128
+
+  UpdateLambdaMemory:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: update_lambda_memory
+      Runtime:  python3.13
+      Handler: update_lambda_memory.lambda_handler
+      Role: !GetAtt UpdateLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          
+          def update_lambda_memory(function_name, memory_size):
+              lambda_client = boto3.client('lambda')
+              lambda_client.update_function_configuration(
+                  FunctionName=function_name,
+                  MemorySize=int(memory_size)
+              )
+          
+          def lambda_handler(event, context):
+              ssm_client = boto3.client('ssm')
+              function_name = event['detail']['name'].split("/")[-1]
+              response = ssm_client.get_parameter(Name=event['detail']['name'])
+              memory_size = response['Parameter']['Value']
+              
+              update_lambda_memory(function_name, memory_size)
+              return {'status': 'Updated Lambda memory'}
+      Timeout: 300
+      MemorySize: 128
+
+  # EventBridge Scheduler Rule
+  LambdaMemoryOptimizationRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: LambdaMemoryOptimization
+      Description: 'Triggers Lambda to fetch Compute Optimizer recommendations'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerLambda
+          Arn: !GetAtt ComputeOptimizerLambda.Arn
+
+  # EventBridge Rule for SSM Parameter Changes
+  SSMParameterChangeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: SSMParameterChangeRule
+      Description: 'Monitors SSM Parameter Store changes'
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - 'Parameter Store Change'
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: '/lambda/memory/'
+      State: ENABLED
+      Targets:
+        - Id: UpdateLambdaMemory
+          Arn: !GetAtt UpdateLambdaMemory.Arn
+
+  # Lambda Permissions
+  ComputeOptimizerLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ComputeOptimizerLambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt LambdaMemoryOptimizationRule.Arn
+
+  UpdateLambdaMemoryPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref UpdateLambdaMemory
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt SSMParameterChangeRule.Arn
+
+Outputs:
+  ComputeOptimizerLambdaArn:
+    Description: 'ARN of the Compute Optimizer Lambda function'
+    Value: !GetAtt ComputeOptimizerLambda.Arn
+
+  UpdateLambdaMemoryArn:
+    Description: 'ARN of the Update Lambda Memory function'
+    Value: !GetAtt UpdateLambdaMemory.Arn
+
+  LambdaMemoryOptimizationRuleArn:
+    Description: 'ARN of the EventBridge Scheduler Rule'
+    Value: !GetAtt LambdaMemoryOptimizationRule.Arn
+
+  SSMParameterChangeRuleArn:
+    Description: 'ARN of the SSM Parameter Change Rule'
+    Value: !GetAtt SSMParameterChangeRule.Arn

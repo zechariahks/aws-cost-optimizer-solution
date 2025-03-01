@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 Cost Optimization with AWS Compute Optimizer'
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: 'Schedule expression for the EventBridge rule'
+
+Resources:
+  # IAM Roles
+  ComputeOptimizerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-optimizer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ComputeOptimizerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'compute-optimizer:GetEC2InstanceRecommendations'
+                  - 'ec2:DescribeInstances'
+                  - 'ssm:PutParameter'
+                Resource: '*'
+
+  UpdateEC2Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-update-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: UpdateEC2Config
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:ModifyInstanceAttribute'
+                  - 'ec2:StartInstances'
+                  - 'ec2:StopInstances'
+                  - 'ssm:GetParameter'
+                Resource: '*'
+
+  # Lambda Functions
+  ComputeOptimizerLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-optimizer'
+      Runtime: python3.8
+      Handler: compute_optimizer_ec2.lambda_handler
+      Role: !GetAtt ComputeOptimizerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  client = boto3.client('compute-optimizer')
+                  ssm_client = boto3.client('ssm')
+                  ec2_client = boto3.client('ec2')
+                  
+                  response = client.get_ec2_instance_recommendations()
+                  
+                  recommendations_processed = 0
+                  for recommendation in response['instanceRecommendations']:
+                      instance_id = recommendation['instanceArn'].split('/')[-1]
+                      current_instance_type = recommendation['currentInstanceType']
+                      
+                      instance_response = ec2_client.describe_instances(
+                          InstanceIds=[instance_id]
+                      )
+                      
+                      if instance_response['Reservations']:
+                          if recommendation['recommendationOptions']:
+                              recommended_instance_type = recommendation['recommendationOptions'][0]['instanceType']
+                              
+                              param_name = f"/ec2/instance-type/{instance_id}"
+                              param_value = json.dumps({
+                                  'instance_id': instance_id,
+                                  'current_type': current_instance_type,
+                                  'recommended_type': recommended_instance_type,
+                                  'last_updated': datetime.now().isoformat()
+                              })
+                              
+                              ssm_client.put_parameter(
+                                  Name=param_name,
+                                  Value=param_value,
+                                  Type='String',
+                                  Overwrite=True
+                              )
+                              
+                              recommendations_processed += 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {recommendations_processed} recommendations'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  UpdateEC2Lambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-updater'
+      Runtime: python3.8
+      Handler: update_ec2_instance.lambda_handler
+      Role: !GetAtt UpdateEC2Role.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  param_name = event['detail']['name']
+                  
+                  ssm_client = boto3.client('ssm')
+                  ec2_client = boto3.client('ec2')
+                  
+                  param_response = ssm_client.get_parameter(Name=param_name)
+                  param_value = json.loads(param_response['Parameter']['Value'])
+                  
+                  instance_id = param_value['instance_id']
+                  recommended_type = param_value['recommended_type']
+                  
+                  response = ec2_client.describe_instances(
+                      InstanceIds=[instance_id]
+                  )
+                  
+                  if response['Reservations']:
+                      instance = response['Reservations'][0]['Instances'][0]
+                      
+                      if instance['State']['Name'] == 'stopped':
+                          ec2_client.modify_instance_attribute(
+                              InstanceId=instance_id,
+                              InstanceType={'Value': recommended_type}
+                          )
+                          
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': f'Successfully updated instance {instance_id}'
+                              })
+                          }
+                      else:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({
+                                  'message': f'Instance {instance_id} must be stopped first'
+                              })
+                          }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Timeout: 300
+      MemorySize: 128
+
+  # EventBridge Rules
+  OptimizationScheduleRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${AWS::StackName}-schedule'
+      Description: 'Triggers Lambda to fetch Compute Optimizer recommendations'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: ComputeOptimizerLambda
+          Arn: !GetAtt ComputeOptimizerLambda.Arn
+
+  ParameterChangeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${AWS::StackName}-parameter'
+      Description: 'Monitors SSM Parameter Store changes'
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - 'Parameter Store Change'
+        detail:
+          operation:
+            - Update
+          name:
+            - prefix: '/ec2/instance-type/'
+      State: ENABLED
+      Targets:
+        - Id: UpdateEC2Lambda
+          Arn: !GetAtt UpdateEC2Lambda.Arn
+
+  # Lambda Permissions
+  ComputeOptimizerLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ComputeOptimizerLambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt OptimizationScheduleRule.Arn
+
+  UpdateEC2LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref UpdateEC2Lambda
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt ParameterChangeRule.Arn
+
+Outputs:
+  ComputeOptimizerLambdaArn:
+    Description: 'ARN of the Compute Optimizer Lambda function'
+    Value: !GetAtt ComputeOptimizerLambda.Arn
+
+  UpdateEC2LambdaArn:
+    Description: 'ARN of the Update EC2 Lambda function'
+    Value: !GetAtt UpdateEC2Lambda.Arn
+
+  StackName:
+    Description: 'Name of the stack'
+    Value: !Ref 'AWS::StackName'
+
+  Region:
+    Description: 'Region where the stack is deployed'
+    Value: !Ref 'AWS::Region'
