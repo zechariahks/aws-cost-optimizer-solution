@@ -14,6 +14,8 @@ AWS Lambda offers a flexible way to run serverless applications, but selecting t
 
 ## Architecture Overview
 
+![Architecture](../lambda-cost-optimizer.jpg)
+
 ### Components Used:
 
 1. **AWS Compute Optimizer** – Provides memory recommendations for Lambda functions.
@@ -23,11 +25,15 @@ AWS Lambda offers a flexible way to run serverless applications, but selecting t
 5. **Amazon EventBridge Rule** – Listens for SSM parameter updates and triggers Lambda updates.
 6. **AWS CloudFormation/Terraform** – Dynamically references SSM parameters during deployment.
 
+Source Code in this article is located here https://github.com/zechariahks/aws-cost-optimizer-solution/lambda/. Feel free to provide your feedback.
+
 ---
 
 ## Implementation Steps
 
 ### Step 1: Enable AWS Compute Optimizer for Lambda
+
+In order to use Compute Optimizer in an account, It should be enabled first. Follow below steps to enable Compute Otpimizer.
 
 #### Using AWS Console:
 1. Navigate to the **AWS Compute Optimizer** console.
@@ -308,11 +314,15 @@ aws cloudformation create-stack --stack-name lambdastack --template-body file://
 
 ## Deploy the infrastructure stack 
 
+If you want to use CloudFormation to deploy all the above resources, you can use the template lambda-optimizer-template.yml located at https://github.com/zechariahks/aws-cost-optimizer-solution/lambda/templates/ location.
+
 ```
 aws cloudformation create-stack --stack-name lambda-cost-optimization --template-body file://lambda-optimizer-template.yml \
     --capabilities CAPABILITY_NAMED_IAM
 ```
+
 ### Script to invoke lambda function to generate recommendations
+As per the [documentation](https://docs.aws.amazon.com/compute-optimizer/latest/ug/requirements.html#requirements-lambda-functions), lambda function must be invoked at least 50 times in the lat 14 days to generate recommendations. You can use below script for invoking your lambda function.
 
 ```sh
 #!/bin/bash
