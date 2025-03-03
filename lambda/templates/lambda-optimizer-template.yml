@@ -96,7 +96,7 @@ Resources:
     Properties:
       FunctionName: update_lambda_memory
       Runtime:  python3.13
-      Handler: update_lambda_memory.lambda_handler
+      Handler: index.lambda_handler
       Role: !GetAtt UpdateLambdaRole.Arn
       Code:
         ZipFile: |
