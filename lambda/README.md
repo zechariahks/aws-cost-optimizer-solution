@@ -193,7 +193,7 @@ OPTIMIZER_FUNCTION_ARN=$(aws lambda create-function \
     --function-name compute_optimizer_lambda \
     --runtime python3.13 \
     --role "$OPTIMIZER_ROLE_ARN" \
-    --handler compute_optimizer_lambda.handler \
+    --handler index.get_lambda_recommendations \
     --zip-file fileb://compute_optimizer_lambda.zip \
     --query 'FunctionArn' \
     --output text)
@@ -244,7 +244,7 @@ UPDATE_FUNCTION_ARN=$(aws lambda create-function \
     --function-name update_lambda_memory \
     --runtime python3.13 \
     --role "$UPDATE_ROLE_ARN" \
-    --handler update_lambda_memory.handler \
+    --handler index.lambda_handler \
     --zip-file fileb://update_lambda_memory_function.zip \
     --query 'FunctionArn' \
     --output text)

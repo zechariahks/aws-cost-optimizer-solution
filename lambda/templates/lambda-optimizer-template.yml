@@ -63,7 +63,7 @@ Resources:
     Properties:
       FunctionName: compute_optimizer_lambda
       Runtime:  python3.13
-      Handler: compute_optimizer_lambda.get_lambda_recommendations
+      Handler: index.get_lambda_recommendations
       Role: !GetAtt ComputeOptimizerLambdaRole.Arn
       Code:
         ZipFile: |
