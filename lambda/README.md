@@ -193,7 +193,7 @@ OPTIMIZER_FUNCTION_ARN=$(aws lambda create-function \
     --function-name compute_optimizer_lambda \
     --runtime python3.13 \
     --role "$OPTIMIZER_ROLE_ARN" \
-    --handler index.get_lambda_recommendations \
+    --handler compute_optimizer_lambda.get_lambda_recommendations \
     --zip-file fileb://compute_optimizer_lambda.zip \
     --query 'FunctionArn' \
     --output text)
@@ -244,7 +244,7 @@ UPDATE_FUNCTION_ARN=$(aws lambda create-function \
     --function-name update_lambda_memory \
     --runtime python3.13 \
     --role "$UPDATE_ROLE_ARN" \
-    --handler index.lambda_handler \
+    --handler update_lambda_memory.lambda_handler \
     --zip-file fileb://update_lambda_memory_function.zip \
     --query 'FunctionArn' \
     --output text)
@@ -364,10 +364,10 @@ If you used CLI commands to create the resources, then run the following command
 
 ```sh
 # 1. Delete EventBridge Rules
-aws events remove-targets --rule LambdaMemoryOptimization --ids "1"
+aws events remove-targets --rule LambdaMemoryOptimization --ids "ComputeOptimizerLambda"
 aws events delete-rule --name LambdaMemoryOptimization
 
-aws events remove-targets --rule SSMParameterChangeRule --ids "1"
+aws events remove-targets --rule SSMParameterChangeRule --ids "UpdateLambdaMemory"
 aws events delete-rule --name SSMParameterChangeRule
 
 # 2. Delete Lambda Functions
