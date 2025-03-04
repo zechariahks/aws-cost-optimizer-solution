@@ -25,7 +25,7 @@ AWS Lambda offers a flexible way to run serverless applications, but selecting t
 5. **Amazon EventBridge Rule** – Listens for SSM parameter updates and triggers Lambda updates.
 6. **AWS CloudFormation/Terraform** – Dynamically references SSM parameters during deployment.
 
-Source Code in this article is located here https://github.com/zechariahks/aws-cost-optimizer-solution/lambda/. Feel free to provide your feedback.
+Source Code in this article is located here https://github.com/zechariahks/aws-cost-optimizer-solution/tree/main/lambda. Feel free to provide your feedback.
 
 ---
 
@@ -61,6 +61,8 @@ aws ssm put-parameter --name "/lambda/memory/MyFunction" --value "512" --type "S
 ```
 
 ### Step 2: Create IAM Roles
+
+Next, we will create the IAM roles that are required for the Lambda functions. These roles will have the adequate permissions to pull Compute Optimizer recommendations and update the relevant resources.
 
 #### Using AWS Console:
 
@@ -114,7 +116,8 @@ aws iam put-role-policy \
             "Effect": "Allow",
             "Action": [
                 "compute-optimizer:GetLambdaFunctionRecommendations",
-                "ec2:DescribeInstances",
+                "lambda:ListFunctions",
+                "lambda:ListProvisionedConcurrencyConfigs",
                 "ssm:PutParameter"
             ],
             "Resource": "*"
@@ -160,11 +163,16 @@ aws iam put-role-policy \
 
 ### Step 3: Create a Lambda Function to Fetch Compute Optimizer Recommendations
 
+Now, we will create the lambda function that fetches the recommendations from Compute Optimizer.
+
 #### Create a Python Lambda function (`compute_optimizer_lambda.py`):
+
+On your local directory, create a file named compute_optimizer_lambda.py and add below code into it and save the file.
+
 ```python
 import boto3
 
-def get_lambda_recommendations():
+def get_lambda_recommendations(event, context):
     client = boto3.client('compute-optimizer')
     response = client.get_lambda_function_recommendations()
     
@@ -172,9 +180,9 @@ def get_lambda_recommendations():
     
     for recommendation in response['lambdaFunctionRecommendations']:
         function_arn = recommendation['functionArn']
-        memory_size = recommendation['memorySizeRecommendationOptions'][0]['rankedOptions'][0]['memorySize']
-        param_name = f"/lambda/memory/{function_arn.split(':')[-1]}"
-        
+        memory_size = recommendation['memorySizeRecommendationOptions'][0]['memorySize']
+        param_name = f"/lambda/memory/{function_arn.split(':')[-2]}"
+        print(f"Updating {param_name} to {memory_size}")
         ssm_client.put_parameter(
             Name=param_name,
             Value=str(memory_size),
@@ -186,6 +194,9 @@ def get_lambda_recommendations():
 ```
 
 #### Deploy the Lambda function using AWS CLI:
+
+You can deploy the lambda function using the Lambda console  or run below commands to deploy it through CLI. 
+
 ```sh
 zip compute_optimizer_lambda.zip compute_optimizer_lambda.py
 
@@ -195,6 +206,7 @@ OPTIMIZER_FUNCTION_ARN=$(aws lambda create-function \
     --role "$OPTIMIZER_ROLE_ARN" \
     --handler compute_optimizer_lambda.get_lambda_recommendations \
     --zip-file fileb://compute_optimizer_lambda.zip \
+    --timeout 120 \
     --query 'FunctionArn' \
     --output text)
     
@@ -203,18 +215,30 @@ OPTIMIZER_FUNCTION_ARN=$(aws lambda create-function \
 ### Step 4: Schedule Execution with EventBridge
 
 #### Using AWS Console:
-1. Open **Amazon EventBridge Scheduler**.
-2. Create a new schedule to trigger the Lambda function periodically (e.g., daily or weekly).
+1. Open **Amazon EventBridge Console**.
+2. Create a new rule with a schedule to trigger the `compute_optimizer_lambda` Lambda function periodically (e.g., daily or weekly).
 
 #### Using AWS CLI:
+
+On the terminal, run below commands to create the Event Bridge rule that runs daily once. Adjust the schedule as per your need.
+
 ```sh
 aws events put-rule --schedule-expression "rate(1 day)" --name LambdaMemoryOptimization
-aws events put-targets --rule LambdaMemoryOptimization --targets "Id"="1","Arn"="$OPTIMIZER_FUNCTION_ARN"
+aws events put-targets --rule LambdaMemoryOptimization --targets "Id"="ComputeOptimizerLambda","Arn"="$OPTIMIZER_FUNCTION_ARN"
+aws lambda add-permission \
+    --function-name "compute_optimizer_lambda" \
+    --statement-id "EventBridgeInvoke" \
+    --action "lambda:InvokeFunction" \
+    --principal events.amazonaws.com 
 ```
 
 ### Step 5: Create an EventBridge Rule to Detect SSM Parameter Updates and Adjust Lambda Configuration
 
+Follow below steps to create the Lambda function that updates the target lambdas that need modifications recommended by Compute Optimizer. This lambda pulls the saved configurations from SSM Parameter store.
+
 #### Create a Lambda function to update memory configuration (`update_lambda_memory.py`):
+On your local directory, create a file named `update_lambda_memory.py` and add below code into it and save the file.
+
 ```python
 import boto3
 
@@ -230,13 +254,16 @@ def lambda_handler(event, context):
     function_name = event['detail']['name'].split("/")[-1]
     response = ssm_client.get_parameter(Name=event['detail']['name'])
     memory_size = response['Parameter']['Value']
-    
+    print(f"Updating {function_name} to {memory_size}")
     update_lambda_memory(function_name, memory_size)
     return {'status': 'Updated Lambda memory'}
 ```
 
 
 #### Deploy the Lambda function update_lambda_memory using AWS CLI:
+
+You can deploy the lambda function using the Lambda console  or run below commands to deploy it through CLI. 
+
 ```sh
 zip update_lambda_memory_function.zip update_lambda_memory.py
 
@@ -246,12 +273,23 @@ UPDATE_FUNCTION_ARN=$(aws lambda create-function \
     --role "$UPDATE_ROLE_ARN" \
     --handler update_lambda_memory.lambda_handler \
     --zip-file fileb://update_lambda_memory_function.zip \
+    --timeout 120 \
     --query 'FunctionArn' \
     --output text)
     
 ```
 
 #### Configure EventBridge rule to trigger update_lambda_memory function:
+
+#### Using AWS Console:
+- Open **Amazon EventBridge Console**.
+- Choose **Rules** on the left side.
+- Create a new rule with to trigger the `update_lambda_memory` Lambda function  when SSM Parameters are updated. Check below CLI step for the specific event details to use.
+
+#### Using AWS CLI:
+
+On the terminal, run below commands to create the Event Bridge rule that invokes the lambda function when the SSM parameters are updated.
+
 ```sh
 aws events put-rule --name "SSMParameterChangeRule" --event-pattern '{
   "source": ["aws.ssm"],
@@ -259,12 +297,22 @@ aws events put-rule --name "SSMParameterChangeRule" --event-pattern '{
   "detail": { "operation": ["Update"], "name": [{"prefix": "/lambda/memory/"}] }
 }'
 
-aws events put-targets --rule SSMParameterChangeRule --targets "Id"="1","Arn"="$UPDATE_FUNCTION_ARN"
+aws events put-targets --rule SSMParameterChangeRule --targets "Id"="UpdateLambdaMemory","Arn"="$UPDATE_FUNCTION_ARN"
+aws lambda add-permission \
+    --function-name "update_lambda_memory" \
+    --statement-id "EventBridgeInvoke2" \
+    --action "lambda:InvokeFunction" \
+    --principal events.amazonaws.com 
 ```
 
 ### Step 6: Create/Modify IaC (CloudFormation Template) to Use SSM Parameters
 
+This is an example CloudFormation template that is used to deploy a sample Lambda function with an initial memory configuration. 
+
 #### Example in CloudFormation:
+
+Create a file named `sample-lambda.yml` on your local directory and add below code to it.
+
 ```yaml
 Resources:
   LambdaExecutionRole:
@@ -307,6 +355,8 @@ Parameters:
 
 ## Deploy the CloudFormation Stack using CLI
 
+On your terminal, run below command to create the sample CloudFormation stack. Once the stack is deployed, it will take approximately 24 hours for Compute Optimizer generate recommendations for the lambda that was deployed as part of this template.
+
 ```
 aws cloudformation create-stack --stack-name lambdastack --template-body file://sample-lambda.yml --capabilities CAPABILITY_NAMED_IAM
 ```
@@ -346,9 +396,11 @@ done
 echo "All invocations completed"
 ```
 
+After the solution is deployed in the account, wait for 24 hours and you will see lambda recommendations as below. The event bridge rules will get triggered as per the schedule and update the memory configurations for the relevant Lambda functions.
+
 ## Conclusion
 
-This solution ensures continuous Lambda memory optimization using AWS Compute Optimizer, SSM Parameter Store, and EventBridge. The new approach removes the need for Step Functions, streamlining the process while ensuring Lambda functions are dynamically updated based on Compute Optimizer recommendations.
+This solution ensures continuous Lambda memory optimization using AWS Compute Optimizer, SSM Parameter Store, and EventBridge. This approach eliminates the need for manual updates and automates the entire workflow for updating the Lambda functions dynamically based on Compute Optimizer recommendations.
 
 ## Resources:
 

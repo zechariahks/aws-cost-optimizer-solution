@@ -12,6 +12,6 @@ def lambda_handler(event, context):
     function_name = event['detail']['name'].split("/")[-1]
     response = ssm_client.get_parameter(Name=event['detail']['name'])
     memory_size = response['Parameter']['Value']
-    
+    print(f"Updating {function_name} to {memory_size}")
     update_lambda_memory(function_name, memory_size)
     return {'status': 'Updated Lambda memory'}

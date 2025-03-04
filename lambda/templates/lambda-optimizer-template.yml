@@ -4,7 +4,7 @@ Description: 'Lambda Cost Optimization with Compute Optimizer Infrastructure'
 Parameters:
   ScheduleExpression:
     Type: String
-    Default: 'rate(1 hour)'
+    Default: 'rate(1 day)'
     Description: 'Schedule expression for the EventBridge rule'
 
 Resources:
@@ -30,6 +30,8 @@ Resources:
               - Effect: Allow
                 Action:
                   - 'compute-optimizer:GetLambdaFunctionRecommendations'
+                  - 'lambda:ListFunctions'
+                  - 'lambda:ListProvisionedConcurrencyConfigs'
                   - 'ssm:PutParameter'
                 Resource: '*'
 
@@ -77,9 +79,9 @@ Resources:
               
               for recommendation in response['lambdaFunctionRecommendations']:
                   function_arn = recommendation['functionArn']
-                  memory_size = recommendation['memorySizeRecommendationOptions'][0]['rankedOptions'][0]['memorySize']
-                  param_name = f"/lambda/memory/{function_arn.split(':')[-1]}"
-                  
+                  memory_size = recommendation['memorySizeRecommendationOptions'][0]['memorySize']
+                  param_name = f"/lambda/memory/{function_arn.split(':')[-2]}"
+                  print(f"Updating {param_name} to {memory_size}")    
                   ssm_client.put_parameter(
                       Name=param_name,
                       Value=str(memory_size),
@@ -114,7 +116,7 @@ Resources:
               function_name = event['detail']['name'].split("/")[-1]
               response = ssm_client.get_parameter(Name=event['detail']['name'])
               memory_size = response['Parameter']['Value']
-              
+              print(f"Updating {function_name} to {memory_size}")
               update_lambda_memory(function_name, memory_size)
               return {'status': 'Updated Lambda memory'}
       Timeout: 300

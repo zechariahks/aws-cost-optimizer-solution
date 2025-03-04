@@ -53,6 +53,7 @@ Resources:
                   - ec2:DescribeVolumes
                   - compute-optimizer:GetLambdaFunctionRecommendations
                   - lambda:ListFunctions
+                  - lambda:ListProvisionedConcurrencyConfigs
                   - ssm:PutParameter
                 Resource: '*'
 
@@ -530,8 +531,9 @@ Resources:
                   recommendations_processed = 0
                   for recommendation in response['lambdaFunctionRecommendations']:
                       function_arn = recommendation['functionArn']
-                      memory_size = recommendation['memorySizeRecommendationOptions'][0]['rankedOptions'][0]['memorySize']
-                      param_name = f"/lambda/memory/{function_arn.split(':')[-1]}"
+                      memory_size = recommendation['memorySizeRecommendationOptions'][0]['memorySize']
+                      param_name = f"/lambda/memory/{function_arn.split(':')[-2]}"
+                      print(f"Updating {param_name} to {memory_size}")    
 
                       ssm_client.put_parameter(
                           Name=param_name,
@@ -583,7 +585,7 @@ Resources:
                   memory_size = int(param_response['Parameter']['Value'])
 
                   function_arn = param_name.split('/')[-1]
-
+                  print(f"Updating {function_name} to {memory_size}")
                   lambda_client.update_function_configuration(
                       FunctionName=function_arn,
                       MemorySize=memory_size
@@ -816,6 +818,14 @@ Outputs:
   RDSUpdateLambdaArn:
     Description: ARN of the RDS Update Lambda function
     Value: !GetAtt UpdateRDSLambda.Arn
+
+  LambdaOptimizerLambdaArn:
+    Description: ARN of the Lambda Compute Optimizer Lambda function
+    Value: !GetAtt ComputeOptimizerLambdaForLambda.Arn
+
+  LambdaUpdateLambdaArn:
+    Description: ARN of the Lambda Update Lambda function
+    Value: !GetAtt UpdateLambdaLambda.Arn
 
   StackName:
     Description: Name of the stack
